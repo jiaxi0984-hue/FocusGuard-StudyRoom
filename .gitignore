@@ -1,0 +1,53 @@
+# Local dependencies and Python caches
+/_deps/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated binaries, packages, local archives and verification evidence
+/build/
+/dist/
+/outputs/
+/archive/
+/archives/
+/history/
+/backups/
+/.local-archive/
+/screenshots*/
+/verification-*/
+*.spec
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.bak
+*.tmp
+*.log
+*.log.*
+/logs/
+
+# Machine-specific configuration, credentials and historical handoff notes
+config.json
+config.v1-backup-*.json
+events.log*
+install.json
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+/PI_HANDOFF.md
+/验证记录.md
+
+# Editor / operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
