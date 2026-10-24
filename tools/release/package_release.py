@@ -12,7 +12,7 @@ import zipfile
 import zlib
 from focusguard import VERSION
 
-DOCS = ("README.md", "docs/DESIGN.md", "docs/SUPPORTED_GAMES.md", "examples/config.example.json")
+DOCS = ("README.md", "docs/DESIGN.md", "docs/SUPPORTED_GAMES.md", "docs/AUTOSTART.md", "examples/config.example.json")
 SOURCE_FILES = ("main.py", "requirements.txt", "requirements-dev.txt", "run_tests.py", ".gitignore", ".gitattributes")
 SOURCE_DIRECTORIES = ("focusguard", "tests", "tools")
 SCREENSHOTS = ("01-home.png", "02-recognition.png", "03-settings.png", "04-logs.png")

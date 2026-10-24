@@ -5,13 +5,14 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 import os
-from focusguard.monitoring.core import ProcessRecord
+from focusguard.monitoring.core import ProcessRecord, Store, Settings, CONSENT_VERSION
 from focusguard.recognition.discovery import Index, build_index
-from focusguard.ui.app import Window, Indexer, Poller
+from focusguard.ui.app import Window, Indexer, Poller, handle_instance_request, autostart_launch_allowed, main
+from focusguard.windows import installation
 from helpers import make_steam, engine_for, write_pe, cache_bytes
 from focusguard.recognition.rules import RULES
 
@@ -139,6 +140,118 @@ class UITests(unittest.TestCase):
     def test_custom_index_inputs_forbidden_in_real_mode(self):
         with self.assertRaises(ValueError):
             Window(Path(self.temp.name) / "unsafe", index_loader=lambda cancel: Index())
+
+    def test_simulation_refresh_never_expires_or_writes_real_autostart(self):
+        with patch.object(installation, "expire_autostart") as expire, patch.object(installation, "autostart_state") as state:
+            self.window.refresh()
+        expire.assert_not_called()
+        state.assert_not_called()
+        self.assertFalse(self.window.autostart.isEnabled())
+        self.assertIn("北京时间", self.window.autostart_policy_text.text())
+
+    def test_limited_startup_state_is_visible_and_checkbox_locked(self):
+        self.window.simulate = False
+        with patch.object(installation, "is_installed", return_value=True), patch.object(installation, "expire_autostart", return_value=False), patch.object(installation, "autostart_state", return_value=installation.AutostartState(True, True)):
+            self.window.refresh_autostart()
+        self.assertTrue(self.window.autostart.isChecked())
+        self.assertFalse(self.window.autostart.isEnabled())
+        self.assertIn("2026 年 12 月 21 日", self.window.autostart_policy_text.text())
+        self.assertIn("Windows", self.window.autostart_policy_text.text())
+        self.assertIn("不自动开启关机监测", self.window.autostart_policy_text.text())
+        self.assertFalse(self.window.settings.armed)
+
+    def test_windows_disabled_choice_is_displayed_without_repair(self):
+        self.window.simulate = False
+        with patch.object(installation, "is_installed", return_value=True), patch.object(installation, "expire_autostart", return_value=False), patch.object(installation, "autostart_state", return_value=installation.AutostartState(False, True, False, True)), patch.object(installation, "set_autostart") as setter:
+            self.window.refresh_autostart()
+        setter.assert_not_called()
+        self.assertFalse(self.window.autostart.isChecked())
+        self.assertIn("程序不会恢复", self.window.autostart_policy_text.text())
+
+    def test_autostart_error_is_visible_without_repeated_logs(self):
+        self.window.simulate = False
+        with patch.object(installation, "expire_autostart", side_effect=OSError("模拟检查失败")):
+            self.window.refresh_autostart()
+            self.window.refresh_autostart()
+        self.assertEqual(self.window.start_stat.text(), "待检查")
+        self.assertEqual(self.window.logs.toPlainText().count("自启状态检查失败"), 1)
+
+    def test_install_confirmation_can_cancel_without_changes(self):
+        self.window.simulate = False
+        with patch.object(installation, "is_installed", return_value=False), patch("focusguard.ui.app.before_deadline", return_value=True), patch("focusguard.ui.app.QMessageBox.question", return_value=QMessageBox.No) as question, patch.object(installation, "install") as install, patch.object(self.window.monitor, "pause") as pause:
+            self.window.install()
+        install.assert_not_called()
+        pause.assert_not_called()
+        self.assertIn("限期", question.call_args.args[2])
+        self.assertIn("真实关机必须另行确认", question.call_args.args[2])
+        self.assertEqual(question.call_args.args[-1], QMessageBox.No)
+
+    def test_confirmed_install_pauses_then_relaunches_explicitly_paused(self):
+        self.window.monitor.arm(True)
+        self.window.simulate = False
+        target = Path(self.temp.name) / "installed.exe"
+        with patch.object(installation, "is_installed", return_value=False), patch("focusguard.ui.app.QMessageBox.question", return_value=QMessageBox.Yes), patch.object(installation, "install", return_value=target) as install, patch("focusguard.ui.app.subprocess.Popen") as spawn, patch.object(self.window, "finish") as finish:
+            self.window.install()
+        install.assert_called_once()
+        self.assertFalse(self.window.settings.armed)
+        self.assertFalse(self.window.store.load().armed)
+        self.assertIn("--after-install", spawn.call_args.args[0])
+        finish.assert_called_once_with(preserve=True)
+
+    def test_failed_install_does_not_relaunch_or_arm(self):
+        self.window.simulate = False
+        with patch.object(installation, "is_installed", return_value=False), patch("focusguard.ui.app.QMessageBox.question", return_value=QMessageBox.Yes), patch.object(installation, "install", side_effect=OSError("模拟失败")), patch("focusguard.ui.app.subprocess.Popen") as spawn, patch.object(self.window, "error") as error:
+            self.window.install()
+        spawn.assert_not_called()
+        error.assert_called_once()
+        self.assertFalse(self.window.settings.armed)
+
+    def test_after_install_start_disarms_before_any_worker_starts(self):
+        data = Path(self.temp.name) / "after-install"
+        store = Store(data / "config.json")
+        store.save(Settings(armed=True, consent_version=CONSENT_VERSION))
+        observed = []
+        def worker_start(worker):
+            observed.append(store.load().armed)
+        with patch.object(Poller, "start", worker_start), patch.object(Indexer, "start", worker_start), patch.object(Window, "refresh_autostart"):
+            window = Window(data, start_paused=True)
+        try:
+            self.assertEqual(observed, [False, False])
+            self.assertFalse(window.settings.armed)
+        finally:
+            window.stop_workers()
+            window.log_handler.close()
+            window.tray.hide()
+            window.closing = True
+            window.close()
+
+    def test_expired_login_exits_before_window_or_monitor_is_created(self):
+        with patch.object(installation, "expire_autostart") as expire, patch("focusguard.ui.app.before_deadline", return_value=False), patch("focusguard.ui.app.Window") as window:
+            self.assertFalse(autostart_launch_allowed())
+        expire.assert_called_once()
+        window.assert_not_called()
+
+    def test_simulated_login_never_cleans_real_autostart(self):
+        with patch.object(installation, "expire_autostart") as expire:
+            self.assertTrue(autostart_launch_allowed(simulate=True))
+        expire.assert_not_called()
+
+    def test_existing_instance_receives_install_and_uninstall_requests(self):
+        window = Mock()
+        handle_instance_request(window, b"install")
+        window.install.assert_called_once()
+        window.uninstall.assert_not_called()
+        handle_instance_request(window, b"uninstall")
+        window.uninstall.assert_called_once()
+        self.assertEqual(window.reveal.call_count, 2)
+
+    def test_maintenance_cli_disarms_before_constructing_monitoring_window(self):
+        for flag in ("--install", "--uninstall"):
+            with self.subTest(flag=flag), patch("focusguard.ui.app.sys.argv", ["FocusGuard.exe", flag]), patch("focusguard.ui.app.QApplication") as app_class, patch("focusguard.ui.app.QLocalServer"), patch("focusguard.ui.app.QLocalSocket") as socket, patch("focusguard.ui.app.Window") as window, patch("focusguard.ui.app.QTimer.singleShot"):
+                socket.return_value.waitForConnected.return_value = False
+                app_class.return_value.exec.return_value = 0
+                self.assertEqual(main(), 0)
+            self.assertTrue(window.call_args.kwargs["start_paused"])
 
     def test_changed_install_sources_refresh_on_live_candidate(self):
         fixture = make_steam(Path(self.temp.name) / "fresh-steam")

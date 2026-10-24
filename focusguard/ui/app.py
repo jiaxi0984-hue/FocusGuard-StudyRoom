@@ -29,6 +29,7 @@ from focusguard.recognition.engine import Recognizer
 from focusguard.recognition.rules import RULES
 from focusguard import VERSION
 from focusguard.windows import installation
+from focusguard.windows.autostart_policy import before_deadline, DEADLINE_TEXT
 
 STYLE = """
 QWidget { color:#253C36; font-family:'Microsoft YaHei UI','Segoe UI'; font-size:14px; }
@@ -186,13 +187,14 @@ class Indexer(QThread):
 class Window(QMainWindow):
     log_event = Signal(str)
 
-    def __init__(self, data_dir, simulate=False, demo=False, *, index_loader=None, recognizer=None):
+    def __init__(self, data_dir, simulate=False, demo=False, *, index_loader=None, recognizer=None, start_paused=False):
         super().__init__()
         self.simulate, self.demo = simulate, demo
         if not simulate and (index_loader is not None or recognizer is not None):
             raise ValueError("自定义识别输入仅允许用于模拟测试。")
         self.closing = False
         self.process_error = ""
+        self.autostart_error = ""
         self.last_index_summary = None
         self.catalog_view_key = None
         self.observation_view_key = None
@@ -209,9 +211,14 @@ class Window(QMainWindow):
             # 后续保存前先保留损坏原件，避免静默覆盖。
             backup = self.store.path.with_name("config.corrupt-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json")
             shutil.copy2(self.store.path, backup)
-        if simulate:
-            # 模拟会话不继承真实开启状态，不写入生产配置。
+        if simulate or start_paused:
+            # 安装后重启和模拟会话都不继承开启状态。
             self.settings.armed = False
+            if start_paused and not simulate:
+                try:
+                    self.store.save(self.settings)
+                except Exception as exc:
+                    self.initial_error = f"无法保存安装后的暂停状态；本次监测保持关闭：{exc}"
         self.log = logging.getLogger(f"FocusGuard.{id(self)}")
         self.log.setLevel(logging.INFO)
         self.log.propagate = False
@@ -331,10 +338,11 @@ class Window(QMainWindow):
         pl = QVBoxLayout(panel)
         pl.setContentsMargins(22, 22, 22, 22)
         self.autostart = QCheckBox("登录 Windows 后自动启动")
-        self.autostart.setChecked(installation.autostart_enabled())
+        self.autostart.setChecked(False)
         self.autostart.toggled.connect(self.set_autostart)
         pl.addWidget(self.autostart)
-        pl.addWidget(label("安装到本机后可开启。Windows 可能延迟启动；这是登录自启，不是系统启动前拦截。", "muted", True))
+        self.autostart_policy_text = label("", "muted", True)
+        pl.addWidget(self.autostart_policy_text)
         pl.addSpacing(20)
         self.test_mode_label = label("模拟模式：只记录识别结果，绝不关机。" if self.simulate else "当前为真实模式：明确开启后，可靠确认游戏便立即关机。", None, True)
         pl.addWidget(self.test_mode_label)
@@ -395,7 +403,7 @@ class Window(QMainWindow):
         status = self.recognizer.status()
         self.count.setText(f"{status['steam_games']} 款")
         self.action_stat.setText("模拟记录" if self.simulate else "立即关机")
-        self.start_stat.setText("已开启" if installation.autostart_enabled() else "未开启")
+        self.refresh_autostart()
         armed = self.settings.armed
         if status["loading"]:
             state = "安装信息准备中" + (" · 等待识别" if armed else " · 已暂停")
@@ -418,6 +426,41 @@ class Window(QMainWindow):
         if hasattr(self, "tray"):
             self.tray.setToolTip("自习室 · " + state)
         self.refresh_rules(status)
+
+    def refresh_autostart(self):
+        explanation = f"安装后限期自启至 {DEADLINE_TEXT}，覆盖 12 月 20 日全天；不是统一交卷时间。"
+        try:
+            installed = installation.is_installed()
+            if self.simulate:
+                state = installation.AutostartState()
+                text = explanation + " 模拟模式不修改安装或启动项。"
+                summary = "模拟禁改"
+            else:
+                if installation.expire_autostart():
+                    self.add_log("备考自启期限已结束，已移除本程序的登录自启登记。")
+                state = installation.autostart_state()
+                summary = "已到期" if state.expired else "限期自启" if state.enabled and state.limited else "已开启" if state.enabled else "未开启"
+                if state.expired:
+                    text = "备考自启期限已结束，本版本不再自动启用自启；可继续手动打开程序。"
+                elif state.limited:
+                    text = explanation + (" 期限内在应用中固定开启。" if state.enabled else " 已在 Windows 中禁用或移除，程序不会恢复该选择。")
+                else:
+                    text = explanation + " 首次安装确认后自动启用，旧版安装不会在后台静默加入。"
+                text += " 可在 Windows 启动应用中禁用，也可随时暂停、退出或卸载；不自动开启关机监测。"
+            self.autostart.blockSignals(True)
+            self.autostart.setChecked(state.enabled)
+            self.autostart.blockSignals(False)
+            self.autostart.setEnabled(not self.simulate and installed and not state.limited and not state.expired)
+            self.autostart_policy_text.setText(text)
+            self.start_stat.setText(summary)
+            self.autostart_error = ""
+        except Exception as exc:
+            self.autostart.setEnabled(False)
+            self.start_stat.setText("待检查")
+            self.autostart_policy_text.setText(f"自启状态无法检查，未尝试恢复启动项：{exc}")
+            if self.autostart_error != str(exc):
+                self.autostart_error = str(exc)
+                self.add_log(f"自启状态检查失败：{exc}")
 
     def refresh_rules(self, status=None):
         status = status if status is not None else self.recognizer.status()
@@ -578,12 +621,15 @@ class Window(QMainWindow):
         if installation.is_installed():
             QMessageBox.information(self, "已安装", "当前程序已安装到本机。")
             return
-        if QMessageBox.question(self, "安装到本机", "将程序安装到当前用户本地应用目录，并添加到 Windows 已安装应用。是否继续？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        notice = (f"首次安装确认后自动启用当前用户限期登录自启，持续至 {DEADLINE_TEXT}，覆盖 12 月 20 日全天。期限内在应用中固定开启，到期移除自己的启动项。"
+                  if before_deadline() else "本版备考自启期限已过，安装不会启用登录自启。")
+        notice += "\n\n安装到当前用户本地应用目录，并添加到 Windows 已安装应用。可在 Windows 启动应用中禁用，程序不会恢复；同版升级保留已禁用或移除的选择。可随时退出、暂停或卸载，不隐藏驻留、不提权。安装后监测保持暂停，真实关机必须另行确认。是否继续？"
+        if QMessageBox.question(self, "安装与限期自启确认", notice, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         try:
             self.monitor.pause()
             target = installation.install()
-            subprocess.Popen([str(target), "--after-pid", str(os.getpid())], creationflags=subprocess.DETACHED_PROCESS)
+            subprocess.Popen([str(target), "--after-pid", str(os.getpid()), "--after-install"], creationflags=subprocess.DETACHED_PROCESS)
             self.finish(preserve=True)
         except Exception as exc:
             self.error(exc)
@@ -669,6 +715,21 @@ class Window(QMainWindow):
             event.accept()
 
 
+def handle_instance_request(window, message):
+    window.reveal()
+    if message == b"uninstall":
+        window.uninstall()
+    elif message == b"install":
+        window.install()
+
+
+def autostart_launch_allowed(simulate=False):
+    if simulate:
+        return True
+    installation.expire_autostart()
+    return before_deadline()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulate", action="store_true")
@@ -680,6 +741,7 @@ def main():
     parser.add_argument("--screenshot", default="")
     parser.add_argument("--simulation-data", default="", help="仅模拟模式使用的独立测试数据目录")
     parser.add_argument("--after-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--after-install", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.after_pid:
         try:
@@ -704,23 +766,26 @@ def main():
     client = QLocalSocket()
     client.connectToServer(name)
     if client.waitForConnected(400):
-        client.write(b"uninstall" if args.uninstall else b"show")
+        client.write(b"uninstall" if args.uninstall else b"install" if args.install else b"show")
         client.waitForBytesWritten(1000)
         return 0
     QLocalServer.removeServer(name)
     if not server.listen(name):
         QMessageBox.warning(None, "启动失败", "无法建立本机单实例锁；为避免重复监测，本次停止启动。")
         return 1
-    window = Window(data, simulate, args.demo)
+    if args.autostart:
+        try:
+            if not autostart_launch_allowed(simulate):
+                return 0  # 到期后的首次登录仅清理，不启动监测或后台驻留。
+        except Exception as exc:
+            QMessageBox.warning(None, "自启检查未完成", f"未启动监测，请手动打开程序检查：{exc}")
+            return 1
+    window = Window(data, simulate, args.demo, start_paused=args.after_install or args.install or args.uninstall)
     def receive():
         connection = server.nextPendingConnection()
         def read():
             message = bytes(connection.readAll())
-            if message == b"uninstall":
-                window.reveal()
-                window.uninstall()
-            else:
-                window.reveal()
+            handle_instance_request(window, message)
             connection.disconnectFromServer()
         connection.readyRead.connect(read)
         if connection.bytesAvailable():

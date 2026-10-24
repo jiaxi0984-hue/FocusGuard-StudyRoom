@@ -218,13 +218,14 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(command.endswith("--autostart"))
 
     def test_autostart_current_user_only(self):
-        with patch.object(installation, "is_installed", return_value=True), patch.object(installation.winreg, "CreateKey", return_value=MagicMock()) as create, patch.object(installation.winreg, "SetValueEx") as write:
+        with patch.object(installation, "is_installed", return_value=True), patch.object(installation, "autostart_state", return_value=installation.AutostartState()), patch.object(installation, "before_deadline", return_value=True), patch.object(installation, "_run_value", return_value=None), patch.object(installation.winreg, "CreateKey", return_value=MagicMock()) as create, patch.object(installation.winreg, "SetValueEx") as write:
             installation.set_autostart(True)
         self.assertEqual(create.call_args.args, (installation.winreg.HKEY_CURRENT_USER, installation.RUN_KEY))
         self.assertEqual(write.call_args.args[1], "FocusGuardStudyRoom")
 
     def test_autostart_off_removes_only_owned_value(self):
-        with patch.object(installation.winreg, "CreateKey", return_value=MagicMock()), patch.object(installation.winreg, "DeleteValue") as remove:
+        expected = installation.launch_command(installation.exe_path(), "--autostart")
+        with patch.object(installation, "autostart_state", return_value=installation.AutostartState()), patch.object(installation, "_run_value", return_value=expected), patch.object(installation.winreg, "OpenKey", return_value=MagicMock()), patch.object(installation.winreg, "DeleteValue") as remove:
             installation.set_autostart(False)
         self.assertEqual(remove.call_args.args[1], "FocusGuardStudyRoom")
 
